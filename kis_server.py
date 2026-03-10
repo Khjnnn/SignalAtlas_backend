@@ -468,6 +468,9 @@ def _refresh_kis_token_via_auth(force_refresh: bool = False) -> None:
     global _kis_cached_token, _kis_token_expires_at, _kis_auth_ready
 
     ka = _get_kis_module()
+    previous_token = _kis_cached_token
+    previous_expires_at = _kis_token_expires_at
+
     if force_refresh:
         _invalidate_kis_sdk_cached_token()
 
@@ -486,7 +489,15 @@ def _refresh_kis_token_via_auth(force_refresh: bool = False) -> None:
 
     expires_at: Optional[datetime] = None
     if not token:
-        token, expires_at = _issue_kis_token_directly()
+        try:
+            token, expires_at = _issue_kis_token_directly()
+        except Exception as exc:
+            if previous_token:
+                logger.warning("Direct KIS token issue failed, reusing previous cached token: %s", exc)
+                token = previous_token
+                expires_at = previous_expires_at
+            else:
+                raise
 
     if not token:
         if auth_error is not None:
@@ -496,7 +507,7 @@ def _refresh_kis_token_via_auth(force_refresh: bool = False) -> None:
     _apply_kis_token_to_module(token)
 
     if expires_at is None:
-        expires_at = datetime.now() + timedelta(hours=KIS_TOKEN_TTL_HOURS)
+        expires_at = previous_expires_at or (datetime.now() + timedelta(hours=KIS_TOKEN_TTL_HOURS))
 
     _kis_cached_token = token
     _kis_token_expires_at = expires_at
@@ -1044,6 +1055,7 @@ if __name__ == "__main__":
             _start_refresh_scheduler()
 
     app.run(host="0.0.0.0", port=5000, debug=is_debug)
+
 
 
 
