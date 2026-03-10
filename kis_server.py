@@ -123,8 +123,7 @@ def _load_env_file(path: Path) -> bool:
         return False
 
 
-if not _load_env_file(BASE_DIR / ".env"):
-    _load_env_file(BASE_DIR / ".env.example")
+_load_env_file(BASE_DIR / ".env")
 
 
 def _bool_env(name: str, default: bool = False) -> bool:
@@ -134,14 +133,38 @@ def _bool_env(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _session_cookie_secure() -> bool:
+    if os.getenv("SESSION_COOKIE_SECURE") is not None:
+        return _bool_env("SESSION_COOKIE_SECURE", False)
+    return os.getenv("FLASK_ENV", "production").lower() != "development"
+
+
+def _session_cookie_samesite() -> str:
+    value = os.getenv("SESSION_COOKIE_SAMESITE", "").strip()
+    if value:
+        return value
+    return "None" if _session_cookie_secure() else "Lax"
+
+
 def _admin_password_hash() -> str:
     value = os.getenv("ADMIN_PASSWORD_HASH", "")
     return value.strip()
 
 
 def _allowed_origins() -> List[str]:
-    raw = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173")
-    return [x.strip() for x in raw.split(",") if x.strip()]
+    raw = os.getenv("ALLOWED_ORIGINS", "").strip()
+    if raw:
+        values = [x.strip() for x in raw.split(",") if x.strip()]
+        if values:
+            return values
+
+    # Safe fallback set when ALLOWED_ORIGINS is not provided.
+    return [
+        "http://localhost:5173",
+        "http://localhost:5174",
+        r"https://.*\.pages\.dev",
+        r"https://.*\.railway\.app",
+    ]
 
 
 def _database_url() -> str:
@@ -570,17 +593,29 @@ def create_app() -> Flask:
 
     app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET_KEY", "dev-change-this-key")
     app.config["SESSION_COOKIE_HTTPONLY"] = True
-    app.config["SESSION_COOKIE_SAMESITE"] = os.getenv("SESSION_COOKIE_SAMESITE", "Lax")
-    app.config["SESSION_COOKIE_SECURE"] = _bool_env("SESSION_COOKIE_SECURE", False)
+    app.config["SESSION_COOKIE_SAMESITE"] = _session_cookie_samesite()
+    app.config["SESSION_COOKIE_SECURE"] = _session_cookie_secure()
 
+    cors_origins = _allowed_origins()
     CORS(
         app,
-        resources={r"/api/*": {"origins": _allowed_origins()}},
+        resources={r"/api/*": {"origins": cors_origins}},
         supports_credentials=True,
+    )
+
+    logger.info("CORS origins: %s", cors_origins)
+    logger.info(
+        "Session cookie config: secure=%s samesite=%s",
+        app.config["SESSION_COOKIE_SECURE"],
+        app.config["SESSION_COOKIE_SAMESITE"],
     )
 
     _init_db()
     _migrate_legacy_json_if_needed()
+
+    @app.route("/", methods=["GET"])
+    def root() -> Tuple[Response, int]:
+        return jsonify({"ok": True, "service": "signalatlas-backend"}), 200
 
     @app.route("/api/auth/me", methods=["GET"])
     def auth_me() -> Tuple[Response, int]:
@@ -784,6 +819,7 @@ if __name__ == "__main__":
             _start_refresh_scheduler()
 
     app.run(host="0.0.0.0", port=5000, debug=is_debug)
+
 
 
 

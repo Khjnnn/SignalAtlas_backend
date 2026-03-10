@@ -50,3 +50,9 @@ Expected response when not logged in:
 ```json
 {"isAdmin": false}
 ```
+
+
+## Notes
+- NOTE: .env.example is reference only and is not auto-loaded on Railway.
+- Configure all runtime variables in Railway Variables.
+
