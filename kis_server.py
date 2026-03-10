@@ -418,24 +418,39 @@ def _issue_kis_token_directly() -> Tuple[str, Optional[datetime]]:
     ka = _get_kis_module()
     cfg = ka.getEnv()
 
+    appkey = str(cfg.get("my_app") or "").strip()
+    appsecret = str(cfg.get("my_sec") or "").strip()
+    base_url = str(cfg.get("prod") or cfg.get("my_url") or "").strip()
+
+    if not appkey or not appsecret or not base_url:
+        raise RuntimeError("KIS config missing appkey/appsecret/base_url")
+
     payload = {
         "grant_type": "client_credentials",
-        "appkey": cfg["my_app"],
-        "appsecret": cfg["my_sec"],
+        "appkey": appkey,
+        "appsecret": appsecret,
     }
-    req = urllib.request.Request(
-        url=f"{cfg['my_url']}/oauth2/tokenP",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "charset": "UTF-8",
-            "User-Agent": "SignalAtlas-Backend/1.0",
-        },
-        method="POST",
-    )
+
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "text/plain",
+        "charset": "UTF-8",
+        "User-Agent": str(cfg.get("my_agent") or "SignalAtlas-Backend/1.0"),
+    }
 
     try:
+        base_headers = dict(ka._getBaseHeader())
+        headers.update(base_headers)
+    except Exception:
+        pass
+
+    try:
+        req = urllib.request.Request(
+            url=f"{base_url}/oauth2/tokenP",
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
         with urllib.request.urlopen(req, timeout=15) as resp:
             body = json.loads(resp.read().decode("utf-8"))
     except Exception as exc:
@@ -1029,6 +1044,8 @@ if __name__ == "__main__":
             _start_refresh_scheduler()
 
     app.run(host="0.0.0.0", port=5000, debug=is_debug)
+
+
 
 
 
