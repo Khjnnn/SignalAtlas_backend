@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import sqlite3
 import sys
 import threading
@@ -33,6 +34,22 @@ except ImportError:  # pragma: no cover - optional until DATABASE_URL is set
     psycopg = None
     dict_row = None
 
+BASE_DIR = Path(__file__).resolve().parent
+
+
+def _bootstrap_kis_config() -> None:
+    """Ensure KIS config exists on ephemeral Linux hosts like Railway."""
+    config_root = Path.home() / "KIS" / "config"
+    config_root.mkdir(parents=True, exist_ok=True)
+
+    src_yaml = BASE_DIR / "open-trading-api-main" / "kis_devlp.yaml"
+    dst_yaml = config_root / "kis_devlp.yaml"
+    if src_yaml.exists() and not dst_yaml.exists():
+        shutil.copy2(src_yaml, dst_yaml)
+
+
+_bootstrap_kis_config()
+
 # KIS SDK path registration
 _SDK_DIR = os.path.join(os.path.dirname(__file__), "open-trading-api-main", "examples_llm")
 sys.path.insert(0, _SDK_DIR)
@@ -41,8 +58,6 @@ import kis_auth as ka  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
-
-BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "analyses.db"
 LEGACY_ANALYSES_PATH = BASE_DIR / "analyses.json"
 
@@ -747,6 +762,7 @@ if __name__ == "__main__":
             _start_refresh_scheduler()
 
     app.run(host="0.0.0.0", port=5000, debug=is_debug)
+
 
 
 
