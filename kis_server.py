@@ -87,11 +87,19 @@ MARKET_RE = re.compile(r"^(NAS|NYS|AMS|HKS|TSE)$")
 ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 SCHEDULE_REFRESH_HOUR = 18
+KIS_TOKEN_TTL_HOURS = 24
+KIS_TOKEN_SAFETY_MINUTES = 5
+KIS_TOKEN_ENV_KEY = "KIS_ACCESS_TOKEN"
+KIS_TOKEN_EXPIRES_ENV_KEY = "KIS_ACCESS_TOKEN_EXPIRES_AT"
 
 _stock_master: List[Dict[str, str]] = []
 _stock_master_lock = threading.Lock()
 _refresh_lock = threading.Lock()
 _refresh_thread_started = False
+_kis_token_lock = threading.Lock()
+_kis_cached_token = ""
+_kis_token_expires_at: Optional[datetime] = None
+_kis_auth_ready = False
 
 
 def _load_env_file(path: Path) -> bool:
@@ -321,27 +329,161 @@ def _delete_analysis(analysis_id: str) -> bool:
         return cur.rowcount > 0
 
 
-def _ensure_auth() -> None:
+def _parse_kis_expire_at(value: str) -> Optional[datetime]:
+    if not value:
+        return None
+
+    raw = value.strip()
+    if not raw:
+        return None
+
     try:
-        ka = _get_kis_module()
-        ka.auth(svr="prod")
+        return datetime.fromisoformat(raw)
+    except ValueError:
+        pass
+
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.strptime(raw, fmt)
+        except ValueError:
+            continue
+
+    return None
+
+
+def _persist_kis_token_to_env(token: str, expires_at: datetime) -> None:
+    os.environ[KIS_TOKEN_ENV_KEY] = token
+    os.environ[KIS_TOKEN_EXPIRES_ENV_KEY] = expires_at.isoformat(timespec="seconds")
+
+
+def _is_kis_token_valid() -> bool:
+    if not _kis_cached_token or _kis_token_expires_at is None:
+        return False
+
+    margin = timedelta(minutes=KIS_TOKEN_SAFETY_MINUTES)
+    return datetime.now() < (_kis_token_expires_at - margin)
+
+
+def _apply_kis_token_to_module(token: str) -> None:
+    ka = _get_kis_module()
+    cfg = ka.getEnv()
+    product = cfg.get("my_prod", "01")
+
+    ka.changeTREnv("", svr="prod", product=product)
+    ka._base_headers["authorization"] = f"Bearer {token}"
+    ka._base_headers["appkey"] = cfg["my_app"]
+    ka._base_headers["appsecret"] = cfg["my_sec"]
+
+
+def _try_bootstrap_kis_token_from_env() -> bool:
+    global _kis_cached_token, _kis_token_expires_at, _kis_auth_ready
+
+    token = (os.getenv(KIS_TOKEN_ENV_KEY, "") or "").strip()
+    expires_at = _parse_kis_expire_at(os.getenv(KIS_TOKEN_EXPIRES_ENV_KEY, ""))
+
+    if not token or expires_at is None:
+        return False
+
+    margin = timedelta(minutes=KIS_TOKEN_SAFETY_MINUTES)
+    if datetime.now() >= (expires_at - margin):
+        logger.info("Cached KIS token in env is expired or near expiry; requesting a new token")
+        return False
+
+    try:
+        _apply_kis_token_to_module(token)
     except Exception as exc:
-        logger.error("KIS auth failed: %s", exc)
-        raise
+        logger.warning("Failed to apply cached KIS token from env: %s", exc)
+        return False
+
+    _kis_cached_token = token
+    _kis_token_expires_at = expires_at
+    _kis_auth_ready = True
+    logger.info("KIS token restored from env cache (expires at %s)", expires_at.isoformat(timespec="seconds"))
+    return True
+
+
+def _invalidate_kis_sdk_cached_token() -> None:
+    ka = _get_kis_module()
+    token_tmp = str(getattr(ka, "token_tmp", "") or "").strip()
+    if not token_tmp:
+        return
+
+    try:
+        Path(token_tmp).unlink(missing_ok=True)
+    except Exception as exc:
+        logger.warning("Failed to remove KIS SDK token cache file: %s", exc)
+
+
+def _refresh_kis_token_via_auth(force_refresh: bool = False) -> None:
+    global _kis_cached_token, _kis_token_expires_at, _kis_auth_ready
+
+    ka = _get_kis_module()
+    if force_refresh:
+        _invalidate_kis_sdk_cached_token()
+
+    ka.auth(svr="prod")
+
+    token = str(getattr(ka.getTREnv(), "my_token", "") or "").strip()
+    if not token:
+        auth_header = str(getattr(ka, "_base_headers", {}).get("authorization", "") or "")
+        if auth_header.lower().startswith("bearer "):
+            token = auth_header[7:].strip()
+
+    if not token:
+        raise RuntimeError("KIS auth succeeded but token was empty")
+
+    expires_at = datetime.now() + timedelta(hours=KIS_TOKEN_TTL_HOURS)
+    _kis_cached_token = token
+    _kis_token_expires_at = expires_at
+    _kis_auth_ready = True
+    _persist_kis_token_to_env(token, expires_at)
+    logger.info("KIS token refreshed and cached (expires at %s)", expires_at.isoformat(timespec="seconds"))
+
+
+def _ensure_auth(force_refresh: bool = False) -> None:
+    with _kis_token_lock:
+        if not force_refresh and _kis_auth_ready and _is_kis_token_valid():
+            return
+
+        if not force_refresh and not _kis_auth_ready:
+            if _try_bootstrap_kis_token_from_env():
+                return
+
+        try:
+            _refresh_kis_token_via_auth(force_refresh=force_refresh)
+        except Exception as exc:
+            logger.error("KIS auth failed: %s", exc)
+            raise
 
 
 def _kis_get(api_url: str, tr_id: str, params: Dict[str, str]) -> Tuple[Dict[str, Any], int]:
-    _ensure_auth()
-    ka = _get_kis_module()
-    res = ka._url_fetch(api_url, tr_id, "", params)
+    last_error = "KIS request failed"
 
-    if res.isOK():
-        return res.getResponse().json(), 200
+    for attempt in range(2):
+        try:
+            if attempt == 0:
+                _ensure_auth(force_refresh=False)
+            else:
+                _ensure_auth(force_refresh=True)
 
-    err_code = res.getErrorCode()
-    err_msg = res.getErrorMessage()
-    logger.error("KIS API error [%s]: %s", err_code, err_msg)
-    return {"error": f"[{err_code}] {err_msg}"}, 500
+            ka = _get_kis_module()
+            res = ka._url_fetch(api_url, tr_id, "", params)
+
+            if res.isOK():
+                return res.getResponse().json(), 200
+
+            err_code = res.getErrorCode()
+            err_msg = res.getErrorMessage()
+            last_error = f"[{err_code}] {err_msg}"
+            logger.warning("KIS API non-OK (attempt %d/2) [%s]: %s", attempt + 1, err_code, err_msg)
+        except Exception as exc:
+            last_error = str(exc)
+            logger.warning("KIS API request exception (attempt %d/2): %s", attempt + 1, exc)
+
+        if attempt == 0:
+            time.sleep(0.35)
+
+    return {"error": last_error}, 502
 
 
 def _validate_days(value: str, default: int = 100) -> Optional[int]:
@@ -837,6 +979,10 @@ if __name__ == "__main__":
             _start_refresh_scheduler()
 
     app.run(host="0.0.0.0", port=5000, debug=is_debug)
+
+
+
+
 
 
 
