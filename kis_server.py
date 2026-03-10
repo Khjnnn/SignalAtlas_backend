@@ -54,10 +54,30 @@ _bootstrap_kis_config()
 _SDK_DIR = os.path.join(os.path.dirname(__file__), "open-trading-api-main", "examples_llm")
 sys.path.insert(0, _SDK_DIR)
 
-import kis_auth as ka  # noqa: E402
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
+
+_ka_module: Optional[Any] = None
+_ka_import_error: Optional[str] = None
+
+
+def _get_kis_module() -> Any:
+    global _ka_module, _ka_import_error
+    if _ka_module is not None:
+        return _ka_module
+
+    try:
+        _ka_module = __import__("kis_auth")
+        _ka_import_error = None
+        return _ka_module
+    except Exception as exc:
+        _ka_import_error = str(exc)
+        logger.error("KIS module import failed: %s", exc)
+        raise RuntimeError(
+            "KIS backend initialization failed. Check kis_devlp.yaml and KIS credentials."
+        ) from exc
+
+
 DB_PATH = BASE_DIR / "analyses.db"
 LEGACY_ANALYSES_PATH = BASE_DIR / "analyses.json"
 
@@ -279,6 +299,7 @@ def _delete_analysis(analysis_id: str) -> bool:
 
 def _ensure_auth() -> None:
     try:
+        ka = _get_kis_module()
         ka.auth(svr="prod")
     except Exception as exc:
         logger.error("KIS auth failed: %s", exc)
@@ -287,6 +308,7 @@ def _ensure_auth() -> None:
 
 def _kis_get(api_url: str, tr_id: str, params: Dict[str, str]) -> Tuple[Dict[str, Any], int]:
     _ensure_auth()
+    ka = _get_kis_module()
     res = ka._url_fetch(api_url, tr_id, "", params)
 
     if res.isOK():
@@ -762,6 +784,7 @@ if __name__ == "__main__":
             _start_refresh_scheduler()
 
     app.run(host="0.0.0.0", port=5000, debug=is_debug)
+
 
 
 
