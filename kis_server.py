@@ -89,6 +89,7 @@ ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 SCHEDULE_REFRESH_HOUR = 18
 
 _stock_master: List[Dict[str, str]] = []
+_stock_master_lock = threading.Lock()
 _refresh_lock = threading.Lock()
 _refresh_thread_started = False
 
@@ -407,6 +408,17 @@ def _load_stock_master() -> None:
     _stock_master = _download_and_parse_master("kospi") + _download_and_parse_master("kosdaq")
 
 
+def _ensure_stock_master_loaded() -> None:
+    if _stock_master:
+        return
+
+    with _stock_master_lock:
+        if _stock_master:
+            return
+        _load_stock_master()
+        logger.info("Stock master ready: %d", len(_stock_master))
+
+
 def _require_admin(fn):
     @wraps(fn)
     def wrapper(*args, **kwargs):
@@ -612,6 +624,10 @@ def create_app() -> Flask:
 
     _init_db()
     _migrate_legacy_json_if_needed()
+    try:
+        _ensure_stock_master_loaded()
+    except Exception as exc:
+        logger.warning("Stock master initialization failed at startup: %s", exc)
 
     @app.route("/", methods=["GET"])
     def root() -> Tuple[Response, int]:
@@ -655,6 +671,8 @@ def create_app() -> Flask:
         q = _require_non_empty_query(request.args.get("q", ""))
         if q is None:
             return jsonify([]), 200
+
+        _ensure_stock_master_loaded()
 
         q_lower = q.lower()
         results = []
@@ -819,6 +837,7 @@ if __name__ == "__main__":
             _start_refresh_scheduler()
 
     app.run(host="0.0.0.0", port=5000, debug=is_debug)
+
 
 
 
