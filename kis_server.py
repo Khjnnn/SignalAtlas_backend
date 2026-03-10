@@ -414,6 +414,41 @@ def _invalidate_kis_sdk_cached_token() -> None:
         logger.warning("Failed to remove KIS SDK token cache file: %s", exc)
 
 
+def _issue_kis_token_directly() -> Tuple[str, Optional[datetime]]:
+    ka = _get_kis_module()
+    cfg = ka.getEnv()
+
+    payload = {
+        "grant_type": "client_credentials",
+        "appkey": cfg["my_app"],
+        "appsecret": cfg["my_sec"],
+    }
+    req = urllib.request.Request(
+        url=f"{cfg['my_url']}/oauth2/tokenP",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "charset": "UTF-8",
+            "User-Agent": "SignalAtlas-Backend/1.0",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"Direct KIS token issue failed: {exc}") from exc
+
+    token = str(body.get("access_token") or "").strip()
+    if not token:
+        raise RuntimeError("Direct KIS token issue returned empty token")
+
+    expires_at = _parse_kis_expire_at(str(body.get("access_token_token_expired") or ""))
+    return token, expires_at
+
+
 def _refresh_kis_token_via_auth(force_refresh: bool = False) -> None:
     global _kis_cached_token, _kis_token_expires_at, _kis_auth_ready
 
@@ -421,7 +456,12 @@ def _refresh_kis_token_via_auth(force_refresh: bool = False) -> None:
     if force_refresh:
         _invalidate_kis_sdk_cached_token()
 
-    ka.auth(svr="prod")
+    auth_error: Optional[Exception] = None
+    try:
+        ka.auth(svr="prod")
+    except Exception as exc:
+        auth_error = exc
+        logger.warning("KIS SDK auth failed, will fallback to direct token issue: %s", exc)
 
     token = str(getattr(ka.getTREnv(), "my_token", "") or "").strip()
     if not token:
@@ -429,10 +469,20 @@ def _refresh_kis_token_via_auth(force_refresh: bool = False) -> None:
         if auth_header.lower().startswith("bearer "):
             token = auth_header[7:].strip()
 
+    expires_at: Optional[datetime] = None
     if not token:
-        raise RuntimeError("KIS auth succeeded but token was empty")
+        token, expires_at = _issue_kis_token_directly()
 
-    expires_at = datetime.now() + timedelta(hours=KIS_TOKEN_TTL_HOURS)
+    if not token:
+        if auth_error is not None:
+            raise RuntimeError(f"KIS auth failed and fallback token issue also failed: {auth_error}") from auth_error
+        raise RuntimeError("KIS auth did not provide a usable token")
+
+    _apply_kis_token_to_module(token)
+
+    if expires_at is None:
+        expires_at = datetime.now() + timedelta(hours=KIS_TOKEN_TTL_HOURS)
+
     _kis_cached_token = token
     _kis_token_expires_at = expires_at
     _kis_auth_ready = True
@@ -979,6 +1029,7 @@ if __name__ == "__main__":
             _start_refresh_scheduler()
 
     app.run(host="0.0.0.0", port=5000, debug=is_debug)
+
 
 
 
